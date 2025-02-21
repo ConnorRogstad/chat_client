@@ -10,6 +10,8 @@
 #include <arpa/inet.h>
 #include <errno.h>
 #include <unistd.h>
+#include <sys/select.h>
+#include <termios.h>
 
 // Server Specifics and Constants
 #define SERVER "10.115.12.240"
@@ -18,18 +20,33 @@
 
 // receives data from the server from a socket and stores it up to the buffer size
 // this will make sure you receive the messages from other users
-void recvandprint(int fd) {
+// also is the main logic for moving the current message to the next line so that
+// the user can continue to edit it while other messages stream in
+void recvandprint(int fd, char *input_buffer) {
+    static char recv_buffer[BUFSIZE * 2] = ""; // Persistent across function calls
     char buff[BUFSIZE + 1];
     int ret;
-    // continuously save messages
-    while ((ret = recv(fd, buff, BUFSIZE, 0)) > 0) {
+    ret = recv(fd, buff, BUFSIZE, 0);
+    if (ret > 0) {
         buff[ret] = '\0';
-        printf("%s", buff);
-    }
-    // error handling (allows EAGAIN - no available data)
-    if (ret == -1 && errno != EAGAIN) {
+        // Clear current line, print message, and restore input with prompt
+        strcat(recv_buffer, buff);
+        char *newline;
+        // process the message and print full message
+        while ((newline = strchr(recv_buffer, '\n')) != NULL) {
+            *newline = '\0';
+            printf("\r\033[K%s\n", recv_buffer);
+            memmove(recv_buffer, newline + 1, strlen(newline + 1) + 1);
+        }
+        // Restore input prompt
+        printf("\r> %s", input_buffer);
+        fflush(stdout);
+    } else if (ret == -1 && errno != EAGAIN) {
         perror("recv error");
         exit(errno);
+    } else if (ret == 0) {
+        printf("Server disconnected\n");
+        exit(0);
     }
 }
 
@@ -83,29 +100,90 @@ int main(int argc, char *argv[]) {
     snprintf(name_msg, sizeof(name_msg), "%s\n", argv[1]);
     sendout(fd, name_msg);
 
+    // Set terminal to non-canonical mode
+    struct termios oldt, newt;
+    tcgetattr(STDIN_FILENO, &oldt);
+    newt = oldt;
+    newt.c_lflag &= ~(ICANON | ECHO);
+    newt.c_cc[VMIN] = 1;
+    newt.c_cc[VTIME] = 0;
+    tcsetattr(STDIN_FILENO, TCSANOW, &newt);
+
     // the main chat loop for sending and receiving messages from the server
-    char *line = NULL;
-    size_t len = 0;
+    char input_buffer[BUFSIZE] = "";
+    int pos = 0;
+    fd_set read_fds;
+
     // while true
     while (1) {
+        // check on the input from the user and from the server
+        FD_ZERO(&read_fds);
+        FD_SET(STDIN_FILENO, &read_fds);
+        FD_SET(fd, &read_fds);
+
+        // Wait for activity, and handle errors if they arise
+        if (select(fd + 1, &read_fds, NULL, NULL, NULL) == -1) {
+            perror("select error");
+            break;
+        }
+
         // receive and print incoming messages
-        recvandprint(fd);
-        // read the user's input
-        if (getline(&line, &len, stdin) > 1) {
-            // send user's message to the server
-            sendout(fd, line);
-            // exit chatroom on quit
-            if (strcmp(line, "quit\n") == 0) {
-                char exit_msg[BUFSIZE];
-                snprintf(exit_msg, sizeof(exit_msg), "has left the room.\n");
-                sendout(fd, exit_msg);
-                break;
+        if (FD_ISSET(fd, &read_fds)) {
+            recvandprint(fd, input_buffer);
+        }
+
+        // check to see if there is user input to grab
+        if (FD_ISSET(STDIN_FILENO, &read_fds)) {
+            // read the user's input (single char at a time)
+            char c;
+            // if there is a char
+            if (read(STDIN_FILENO, &c, 1) > 0) {
+                // if its the enter key
+                if (c == '\n') {
+                    // complete message and format it
+                    input_buffer[pos] = '\n';
+                    input_buffer[pos + 1] = '\0';
+                    // send user's message to the server
+                    sendout(fd, input_buffer);
+                    // exit chatroom on quit
+                    if (strcmp(input_buffer, "quit\n") == 0) {
+                        char exit_msg[BUFSIZE];
+                        snprintf(exit_msg, sizeof(exit_msg), " has left the room.\n");
+                        sendout(fd, exit_msg);
+                        break;
+                    }
+                    // move down for user to enter a new message
+                    input_buffer[0] = '\0';
+                    pos = 0;
+                    printf("\r\033[K> ");
+                    fflush(stdout);
+                }
+                // handles the backspace key, so that the user can edit their message
+                else if (c == 127) {
+                    // Don't delete if there is nothing to delete
+                    if (pos > 0) {
+                    // move position back and delete char
+                        pos--;
+                        input_buffer[pos] = '\0';
+                        printf("\r\033[K> %s", input_buffer);
+                        fflush(stdout);
+                    }
+                }
+                // for the addition of regular chars
+                else if (pos < BUFSIZE - 2) {
+                    // add it to buffer, and increase position
+                    input_buffer[pos] = c;
+                    pos++;
+                    input_buffer[pos] = '\0';
+                    printf("\r\033[K> %s", input_buffer);
+                    fflush(stdout);
+                }
             }
         }
     }
 
-    // de-allocate memory, close socket, and finish
-    free(line);
+    // change the terminal setting back to canonical, close socket, and finish
+    tcsetattr(STDIN_FILENO, TCSANOW, &oldt);
     close(fd);
     return 0;
 }
