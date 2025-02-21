@@ -95,7 +95,12 @@ int main(int argc, char *argv[]) {
             // send user's message to the server
             sendout(fd, line);
             // exit chatroom on quit
-            if (strcmp(line, "quit\n") == 0) break;
+            if (strcmp(line, "quit\n") == 0) {
+                char exit_msg[BUFSIZE];
+                snprintf(exit_msg, sizeof(exit_msg), "has left the room.\n");
+                sendout(fd, exit_msg);
+                break;
+            }
         }
     }
 
